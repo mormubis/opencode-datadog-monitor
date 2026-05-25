@@ -34,7 +34,6 @@
     "access": "public"
   },
   "dependencies": {
-    "dd-trace": "^5.0.0",
     "strip-json-comments": "^5.0.1"
   },
   "devDependencies": {
