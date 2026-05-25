@@ -43,6 +43,8 @@ interface SessionState {
   providerID: string;
   modelID: string;
   completedMessages: Set<string>;
+  lastUserInput?: string;
+  lastAssistantOutput?: string;
 }
 
 interface ToolContext {
@@ -53,6 +55,7 @@ interface ToolContext {
 
 const sessions = new Map<string, SessionState>();
 const toolContexts = new Map<string, ToolContext>();
+const messageRoles = new Map<string, string>();
 const pendingSpans: Span[] = [];
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -300,6 +303,13 @@ export const DatadogLLMObsPlugin: Plugin = async (input) => {
             const state = sessions.get(sessionID);
             if (state) {
               const endNs = nowNs();
+              const agentMeta: SpanMeta = { kind: "agent" };
+              if (state.lastUserInput) {
+                agentMeta.input = { value: state.lastUserInput };
+              }
+              if (state.lastAssistantOutput) {
+                agentMeta.output = { value: state.lastAssistantOutput };
+              }
               pendingSpans.push({
                 name: "opencode",
                 span_id: state.agentSpanID,
@@ -307,7 +317,7 @@ export const DatadogLLMObsPlugin: Plugin = async (input) => {
                 parent_id: "undefined",
                 start_ns: state.agentStartNs,
                 duration: endNs - state.agentStartNs,
-                meta: { kind: "agent" },
+                meta: agentMeta,
                 status: "ok",
                 session_id: sessionID,
                 tags,
@@ -315,6 +325,8 @@ export const DatadogLLMObsPlugin: Plugin = async (input) => {
               // Reset for next turn — new agent span
               state.agentSpanID = newID();
               state.agentStartNs = nowNs();
+              state.lastUserInput = undefined;
+              state.lastAssistantOutput = undefined;
             }
             await flush(apiKey, site, mlApp, tags);
             break;
@@ -338,16 +350,47 @@ export const DatadogLLMObsPlugin: Plugin = async (input) => {
             break;
           }
 
+          case "message.part.updated": {
+            const part = event.properties.part;
+            if (!part || typeof part !== "object") break;
+            const p = part as Record<string, unknown>;
+            if (p["type"] !== "text" || typeof p["text"] !== "string") break;
+            if (p["synthetic"] || p["ignored"]) break;
+
+            const pSessionID = p["sessionID"] as string | undefined;
+            const pMessageID = p["messageID"] as string | undefined;
+            if (!pSessionID || !pMessageID) break;
+
+            const role = messageRoles.get(pMessageID);
+            if (role === "user") {
+              const st = getSessionState(pSessionID);
+              st.lastUserInput = p["text"] as string;
+            } else if (role === "assistant") {
+              const st = getSessionState(pSessionID);
+              st.lastAssistantOutput = p["text"] as string;
+            }
+            break;
+          }
+
           case "message.updated": {
             const info = event.properties.info;
+            if (!info || typeof info !== "object") break;
+            const msgInfo = info as Record<string, unknown>;
+            if (typeof msgInfo["sessionID"] !== "string") break;
+
+            // Track message roles so we can map parts to user/assistant
+            if (typeof msgInfo["id"] === "string" && typeof msgInfo["role"] === "string") {
+              messageRoles.set(msgInfo["id"] as string, msgInfo["role"] as string);
+            }
+
             if (!isCompletedAssistantMessage(info)) break;
 
-            const state = getSessionState(info.sessionID);
-            if (state.completedMessages.has(info.id)) break;
-            state.completedMessages.add(info.id);
+            const msgState = getSessionState(info.sessionID);
+            if (msgState.completedMessages.has(info.id)) break;
+            msgState.completedMessages.add(info.id);
 
-            state.providerID = info.providerID;
-            state.modelID = info.modelID;
+            msgState.providerID = info.providerID;
+            msgState.modelID = info.modelID;
 
             const startNs = Math.floor(info.time.created * 1_000_000);
             const endNs = Math.floor(info.time.completed * 1_000_000);
@@ -355,8 +398,8 @@ export const DatadogLLMObsPlugin: Plugin = async (input) => {
             pendingSpans.push({
               name: info.modelID,
               span_id: newID(),
-              trace_id: state.traceID,
-              parent_id: state.agentSpanID,
+              trace_id: msgState.traceID,
+              parent_id: msgState.agentSpanID,
               start_ns: startNs,
               duration: endNs - startNs,
               meta: {
