@@ -37,8 +37,13 @@ function getProjectName(
   if (config.mlApp) return config.mlApp;
   // PluginInput exposes `worktree` at the top level; cast to access it
   const worktree = (input as unknown as { worktree?: string }).worktree;
-  if (worktree) return basename(worktree);
-  return basename(input.directory) || "opencode";
+  if (worktree) {
+    const name = basename(worktree);
+    if (name.length > 0) return name;
+  }
+  const dirName = basename(input.directory);
+  if (dirName.length > 0) return dirName;
+  return "opencode";
 }
 
 function getSessionState(sessionID: string): SessionState {
